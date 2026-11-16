@@ -11,7 +11,7 @@
  *
  * 用法见 README.md 与 docs/。
  */
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -552,6 +552,100 @@ function composeLines({ version, commits, mode, sizeText, qrKind, items, desc, p
   return lines;
 }
 
+// ---------- 飞书开放平台直达链接 ----------
+const CONSOLE = 'https://open.feishu.cn/app';
+
+/**
+ * 开放平台控制台深链。appId 未知时退化到应用列表。
+ * auth 链接用的是飞书官方错误响应里给出的格式，最可靠。
+ */
+function consoleLinks(appId) {
+  const base = appId ? `${CONSOLE}/${appId}` : CONSOLE;
+  return {
+    apps: CONSOLE,
+    app: base,
+    credentials: appId ? `${base}/baseinfo` : CONSOLE,
+    version: appId ? `${base}/version` : CONSOLE,
+    ability: appId ? `${base}/ability` : CONSOLE,
+    auth: (scopes) =>
+      appId
+        ? `${base}/auth?q=${scopes.join(',')}&op_from=openapi&token_type=tenant`
+        : CONSOLE,
+  };
+}
+
+/** 用系统默认浏览器打开 URL */
+function openInBrowser(url) {
+  try {
+    let child;
+    if (process.platform === 'win32') {
+      child = spawn('rundll32', ['url.dll,FileProtocolHandler', url], {
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: true,
+      });
+    } else if (process.platform === 'darwin') {
+      child = spawn('open', [url], { detached: true, stdio: 'ignore' });
+    } else {
+      child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' });
+    }
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** 检测本机 lark-cli（可选增强，不是必需） */
+function detectLarkCli() {
+  for (const bin of ['lark-cli', 'lark-op-cli', 'lark']) {
+    try {
+      const r = spawnSync(bin, ['--version'], { encoding: 'utf8', timeout: 8000, windowsHide: true });
+      if (r.status === 0) {
+        const line = ((r.stdout || '') + (r.stderr || '')).trim().split('\n')[0];
+        return { bin, version: line };
+      }
+    } catch {
+      /* 未安装，继续试下一个 */
+    }
+  }
+  return null;
+}
+
+async function cmdOpen(args) {
+  const cfgPath = findConfigFile(args.config);
+  let appId = '';
+  if (cfgPath) {
+    try {
+      appId = JSON.parse(fs.readFileSync(cfgPath, 'utf8')).feishu?.appId || '';
+    } catch {
+      /* 配置坏了也照样能打开应用列表 */
+    }
+  }
+  const links = consoleLinks(appId);
+  const target = typeof args.open === 'string' ? args.open : 'apps';
+
+  let url;
+  if (/^https?:\/\//i.test(target)) {
+    url = target;
+  } else if (target === 'auth') {
+    const scopes = String(args.scopes || 'im:message,im:message:send_as_bot,im:resource,im:chat:readonly').split(',');
+    url = links.auth(scopes);
+  } else if (typeof links[target] === 'string') {
+    url = links[target];
+  } else {
+    die(`未知打开目标：${target}`, '可用：apps / app / credentials / version / ability / auth / <完整URL>');
+  }
+
+  console.log(`${C.cyan}▸${C.reset} 打开 ${url}`);
+  if (!openInBrowser(url)) {
+    log.warn('没能自动唤起浏览器，请手动复制上面的链接');
+    return;
+  }
+  if (target === 'version') log.dim('若页面不对，从应用详情页左侧导航进「版本管理与发布」');
+  if (target === 'ability') log.dim('若页面不对，从应用详情页左侧导航进「应用功能」');
+}
+
 // ---------- 子命令 ----------
 /**
  * 首次使用诊断：配置缺失时也能跑。
@@ -578,6 +672,7 @@ async function cmdOnboard(args) {
   cfg.project = cfg.project || {};
   cfg.version = cfg.version || {};
   const cfgDir = cfgPath ? path.dirname(cfgPath) : process.cwd();
+  const links = consoleLinks(cfg.feishu.appId || '');
   console.log('');
 
   const todo = [];
@@ -604,8 +699,9 @@ async function cmdOnboard(args) {
   } else {
     miss('飞书应用凭证', [
       '需要你提供：App ID（cli_ 开头）+ App Secret',
-      '在哪拿：https://open.feishu.cn/app → 你的应用 → 凭证与基础信息',
-      '还没有应用：先去建一个企业自建应用并加「机器人」能力，步骤见 docs/SETUP-FEISHU.md',
+      `直达凭证页：${links.credentials}`,
+      `还没有应用：先在这里创建 ${links.apps}（企业自建应用，免费）`,
+      '建好后要加「机器人」能力、开权限、发布版本；每一步都可以让我用 --open 直接打开对应页面',
     ]);
   }
 
@@ -625,7 +721,11 @@ async function cmdOnboard(args) {
       ok('上传图片权限', 'im:resource 可用');
     } catch (e) {
       console.log(`  ${C.red}✗${C.reset} 上传图片权限不可用`);
-      todo.push([String(e.message).split('\n')[0], '开通权限后必须重新发布应用版本才生效']);
+      todo.push([
+        String(e.message).split('\n')[0],
+        '开通权限后必须重新发布应用版本才生效',
+        `一键申请权限：${links.auth(['im:message', 'im:message:send_as_bot', 'im:resource', 'im:chat:readonly'])}`,
+      ]);
     }
   }
 
@@ -671,7 +771,16 @@ async function cmdOnboard(args) {
     console.log(`  ${C.yellow}!${C.reset} 体验版二维码：未配置路径`);
   }
 
-  // 7. 汇总
+  // 7. 可选增强：lark-cli
+  const lark = detectLarkCli();
+  if (lark) {
+    console.log(`  ${C.green}✓${C.reset} lark-cli：${lark.version}`);
+    console.log(`      ${C.dim}它能调用飞书业务 API，但「加机器人能力/开权限/发版本」仍需在控制台点${C.reset}`);
+  } else {
+    console.log(`  ${C.yellow}!${C.reset} lark-cli：未安装（可选；它用于调业务 API，不能代替控制台开通权限）`);
+  }
+
+  // 8. 汇总
   console.log('');
   if (!todo.length) {
     console.log(`${C.green}${C.bold}全部就绪${C.reset}，可以开始发版：`);
@@ -684,6 +793,7 @@ async function cmdOnboard(args) {
     lines.slice(1).forEach((line) => console.log(`     ${C.dim}${line}${C.reset}`));
   });
   console.log(`\n${C.dim}拿到信息后写入 release.config.json，再运行 --check 验证。${C.reset}`);
+  console.log(`${C.dim}要我直接打开对应页面：node scripts/release.mjs --open auth|version|ability|credentials${C.reset}`);
 }
 
 async function cmdCheck(cfg) {
@@ -746,8 +856,9 @@ async function cmdListChats(cfg) {
 async function main() {
   const args = parseArgs(process.argv.slice(2));
 
-  // 配置可能还不存在：首次使用诊断必须能独立跑
+  // 配置可能还不存在：首次使用诊断与打开控制台必须能独立跑
   if (args.onboard) return cmdOnboard(args);
+  if (args.open) return cmdOpen(args);
 
   const cfg = loadConfig(args);
   if (args.check) return cmdCheck(cfg);

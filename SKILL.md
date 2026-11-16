@@ -74,7 +74,44 @@ node scripts/release.mjs --check
 
 全部 ✓ 之后才进入发版流程。
 
-### 1.4 引导原则
+### 1.4 用户说「找不到」时：直接弹过去，别让他翻菜单
+
+只要用户表现出「找不到入口」，**不要**让他自己找。按下面给直达链接：
+
+| 用户说什么 | 给什么 |
+|---|---|
+| 权限在哪开 / 找不到权限管理 | `node scripts/release.mjs --open auth` |
+| 怎么加机器人能力 / 找不到应用功能 | `--open ability` |
+| 怎么发布版本 / 找不到版本管理 | `--open version` |
+| App ID / Secret 在哪 | `--open credentials` |
+| 还没有应用 | `--open apps` |
+
+`--open` 会**直接唤起系统默认浏览器**（Windows `rundll32` / macOS `open` / Linux `xdg-open`），同时把 URL 打印出来，浏览器没起来时用户可以直接复制。
+
+链接格式（可以自己在对话里拼给用户）：
+
+- 权限申请：`https://open.feishu.cn/app/<appId>/auth?q=im:message,im:message:send_as_bot,im:resource&op_from=openapi&token_type=tenant`
+- 凭证：`https://open.feishu.cn/app/<appId>/baseinfo`
+- 版本：`https://open.feishu.cn/app/<appId>/version`
+- 应用功能：`https://open.feishu.cn/app/<appId>/ability`
+
+> `ability` / `version` 这两个路径如果打不开，让用户从 `https://open.feishu.cn/app/<appId>` 左侧导航点进去。脚本打开这两个页面时也会提示这一句。
+
+**在对话里给链接时用 markdown 可点击格式**，不要只贴裸文本。
+
+### 1.5 关于 lark-cli（别夸大它的能力）
+
+`--onboard` 会检测本机是否装了 `lark-cli` / `lark-op-cli` / `lark`。
+
+要说清楚：
+
+- `lark-cli`（飞书官方 CLI）是拿 **user token 调业务 API**（发消息、读多维表格）的
+- 它**不能**替用户在开放平台后台「添加机器人能力」「申请权限」「发布版本」——这些是控制台 UI 操作，没有开放 API
+- 所以后台配置只能：给直达链接 + 用户点一下
+
+**不要**向用户承诺「装上 lark-cli 就能全自动配好应用」。
+
+### 1.6 引导原则
 
 - **一次只问一件事**，别一口气抛出五条，用户会漏答
 - 每一项都说明「去哪拿 / 怎么做」，不要只说「缺」
@@ -168,6 +205,8 @@ node scripts/release.mjs --image --kind experience
 | 参数 | 说明 |
 |---|---|
 | `--onboard` | **首次使用诊断**：列出现有配置、缺失项、去哪拿（配置不存在也能跑） |
+| `--open <目标>` | 直接打开开放平台页面：`auth` / `ability` / `version` / `credentials` / `apps` / `app` / 任意 URL |
+| `--scopes a,b` | 配合 `--open auth` 指定要申请的权限 |
 | `--check` | 配置自检：凭证、图片上传权限、群、项目 |
 | `--image <路径\|sha256:xxx>` | 指定二维码图片；不传值则取 DSH 最近粘贴的附件 |
 | `--changes-file <路径>` | 人话改动清单，一行一条（去掉行首编号） |
@@ -227,6 +266,7 @@ node scripts/release.mjs --image --kind experience
 | 获取体验版二维码 | ⚠️ 半自动：可复用本地已保存的图，过期需人工重新获取 |
 | 生成临时预览码 | ✅ 能，但约 25 分钟失效，不能外发给别人 |
 | 发飞书群图文消息 | ✅ 能 |
+| **飞书后台配置**（加机器人能力 / 开权限 / 发版本） | ❌ 无 API。只能给直达链接让用户点一下；`lark-cli` 也不行 |
 | 自定义机器人 webhook 发图片 | ❌ 发不了（拿不到 image_key），必须用自建应用 |
 
 ---

@@ -75,6 +75,7 @@ node scripts/release.mjs --image qr.png --kind experience --changes-file changes
 | 命令 | 作用 |
 |---|---|
 | `--onboard` | **首次使用**：诊断缺什么、去哪拿（配置不存在也能跑） |
+| `--open auth` | 直接打开飞书控制台对应页面（`auth`/`ability`/`version`/`credentials`/`apps`） |
 | `--check` | 自检配置、凭证、图片上传权限 |
 | `--list-chats` | 列出机器人所在的群 |
 | `--upload-only` | 只上传代码到微信公众平台 |
