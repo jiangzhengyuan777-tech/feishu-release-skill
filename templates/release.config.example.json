@@ -1,0 +1,22 @@
+{
+  "feishu": {
+    "appId": "cli_填写你的 App ID",
+    "appSecret": "填写你的 App Secret",
+    "chatId": "oc_填写目标群 ID",
+    "webhook": ""
+  },
+  "project": {
+    "root": ".",
+    "devtoolsCli": "",
+    "experienceQr": ".release/experience-qr.png",
+    "buildDir": ".release"
+  },
+  "message": {
+    "title": "我的小程序",
+    "tips": ""
+  },
+  "version": {
+    "source": "git-tag",
+    "tagPrefix": "v"
+  }
+}

@@ -1,0 +1,708 @@
+#!/usr/bin/env node
+/**
+ * feishu-release —— 一条命令把版本发布到飞书群
+ *
+ *   预览/上传小程序 → 生成或复用二维码 → 汇总改动 → 发飞书群图文消息
+ *
+ * 设计原则
+ *   1. 版本号只认一个来源（git tag / package.json / 手动），全链路不漂移
+ *   2. 发群前默认只 dry-run，必须显式去掉 --dry-run 才真发
+ *   3. 配置与凭证放在 release.config.json（勿入库）
+ *
+ * 用法见 README.md 与 docs/。
+ */
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
+const SKILL_ROOT = path.resolve(SELF_DIR, '..');
+const FEISHU = 'https://open.feishu.cn/open-apis';
+
+// ---------- 输出 ----------
+const C = {
+  reset: '\x1b[0m', dim: '\x1b[2m', green: '\x1b[32m', yellow: '\x1b[33m',
+  red: '\x1b[31m', cyan: '\x1b[36m', bold: '\x1b[1m',
+};
+const log = {
+  step: (m) => console.log(`${C.cyan}▸${C.reset} ${m}`),
+  ok: (m) => console.log(`${C.green}✓${C.reset} ${m}`),
+  warn: (m) => console.log(`${C.yellow}!${C.reset} ${m}`),
+  err: (m) => console.error(`${C.red}✗${C.reset} ${m}`),
+  dim: (m) => console.log(`${C.dim}  ${m}${C.reset}`),
+  plain: (m) => console.log(m),
+};
+function die(msg, hint) {
+  log.err(msg);
+  if (hint) console.error(`\n${hint}\n`);
+  process.exit(1);
+}
+
+// ---------- 参数 ----------
+function parseArgs(argv) {
+  const out = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith('--')) continue;
+    const key = a.slice(2);
+    const next = argv[i + 1];
+    if (next !== undefined && !next.startsWith('--')) {
+      out[key] = next;
+      i++;
+    } else {
+      out[key] = true;
+    }
+  }
+  return out;
+}
+
+// ---------- 配置 ----------
+function loadConfig(args) {
+  const cfgPath = path.resolve(args.config || process.env.FEISHU_RELEASE_CONFIG || 'release.config.json');
+  if (!fs.existsSync(cfgPath)) {
+    die(
+      `找不到配置文件：${cfgPath}`,
+      '复制模板后填写：\n  copy templates\\release.config.example.json release.config.json',
+    );
+  }
+  let cfg;
+  try {
+    cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  } catch (e) {
+    die(`配置文件不是合法 JSON：${e.message}`);
+  }
+  cfg.feishu = cfg.feishu || {};
+  cfg.project = cfg.project || {};
+  cfg.message = cfg.message || {};
+  cfg.version = cfg.version || {};
+  cfg._path = cfgPath;
+  cfg._dir = path.dirname(cfgPath);
+
+  // 项目根目录：命令行为准，其次配置，最后配置文件所在目录
+  const rootRaw = args.project || cfg.project.root || '.';
+  cfg.project.root = path.resolve(cfg._dir, rootRaw);
+  if (!fs.existsSync(cfg.project.root)) die(`项目目录不存在：${cfg.project.root}`);
+
+  // 产物目录
+  cfg.project.buildDir = path.resolve(cfg.project.root, cfg.project.buildDir || '.release');
+
+  // 体验版二维码路径（相对项目根）
+  if (cfg.project.experienceQr) {
+    cfg.project.experienceQr = path.resolve(cfg.project.root, cfg.project.experienceQr);
+  }
+  return cfg;
+}
+
+// ---------- git ----------
+function run(cmd, args, opts = {}) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, ...opts });
+  return { status: r.status, out: (r.stdout || '').trim(), err: (r.stderr || '').trim() };
+}
+function git(cwd, args, { allowFail = true } = {}) {
+  const r = run('git', args, { cwd });
+  if (r.status !== 0) {
+    if (allowFail) return '';
+    throw new Error(`git ${args.join(' ')} 失败：${r.err}`);
+  }
+  return r.out;
+}
+const isGitRepo = (dir) => git(dir, ['rev-parse', '--is-inside-work-tree']) === 'true';
+
+// ---------- 版本号 ----------
+/**
+ * 版本号只有一个来源：
+ *   git-tag（默认，取最新 tag）/ package.json / manual（必须 --version）
+ */
+function resolveVersion(cfg, explicit) {
+  const source = cfg.version.source || 'git-tag';
+  const prefix = cfg.version.tagPrefix ?? 'v';
+  const projectRoot = cfg.project.root;
+
+  if (source === 'manual' && !explicit) {
+    die('version.source = manual，必须用 --version 指定版本号');
+  }
+
+  if (explicit) {
+    const v = explicit.replace(/^v/, '');
+    if (!/^\d+\.\d+\.\d+$/.test(v)) die(`版本号格式应为 1.2.3 或 v1.2.3，收到：${explicit}`);
+    return { version: v, tag: `${prefix}${v}`, source: '命令行指定', explicit: true };
+  }
+
+  if (source === 'package.json') {
+    const pkgPath = path.join(projectRoot, 'package.json');
+    if (!fs.existsSync(pkgPath)) die('配置读 package.json，但项目里没有 package.json');
+    const v = JSON.parse(fs.readFileSync(pkgPath, 'utf8')).version;
+    if (!v) die('package.json 里没有 version 字段');
+    return { version: v, tag: `${prefix}${v}`, source: 'package.json' };
+  }
+
+  // 默认 git-tag
+  if (!isGitRepo(projectRoot)) {
+    die('项目不是 git 仓库，无法从 tag 读版本号', '改用 version.source = "package.json" 或 "manual"');
+  }
+  const tags = git(projectRoot, ['tag', '--list', `${prefix}*`, '--sort=-v:refname'])
+    .split('\n')
+    .filter(Boolean)
+    .map((t) => t.replace(new RegExp(`^${prefix}`), ''))
+    .filter((t) => /^\d+\.\d+\.\d+$/.test(t));
+  if (!tags.length) {
+    die(
+      `仓库里没有 ${prefix}X.Y.Z 形式的 tag`,
+      '先提交并打 tag：\n  git tag -a v1.2.3 -m "v1.2.3 说明"\n  git push origin v1.2.3',
+    );
+  }
+  return { version: tags[0], tag: `${prefix}${tags[0]}`, source: 'git tag' };
+}
+
+/** 版本一致性自检：版本号是否真有对应 tag */
+function checkVersionConsistency(cfg, ver) {
+  const root = cfg.project.root;
+  if (!isGitRepo(root) || !ver.tag) return { ok: true, note: '' };
+  const has = git(root, ['tag', '--list', ver.tag]);
+  if (!has) {
+    return { ok: false, note: `仓库里没有 ${ver.tag} 这个 tag，公众平台和群里会显示 ${ver.version}，与 git 对不上` };
+  }
+  return { ok: true, note: '' };
+}
+
+// ---------- 改动信息 ----------
+/** 取「起点之后」的提交：标题 + 正文里 - 开头的要点 */
+function collectCommits(root, fromTag) {
+  const SEP = '\x1e';
+  const FLD = '\x1f';
+  const fmt = `--pretty=format:%h${FLD}%s${FLD}%b${SEP}`;
+  const parse = (text) =>
+    text
+      .split(SEP)
+      .map((c) => c.trim())
+      .filter(Boolean)
+      .map((chunk) => {
+        const [sha, subject, body] = chunk.split(FLD);
+        const details = (body || '')
+          .split('\n')
+          .map((l) => l.trim())
+          .filter((l) => /^[-*]\s+\S/.test(l))
+          .map((l) => l.replace(/^[-*]\s+/, '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean)
+          .slice(0, 20);
+        return { sha: (sha || '').trim(), subject: (subject || '').trim(), details };
+      })
+      .filter((c) => c.subject);
+
+  if (!isGitRepo(root)) return { commits: [], mode: '' };
+
+  let commits = [];
+  let mode;
+  if (fromTag) {
+    commits = parse(git(root, ['log', `${fromTag}..HEAD`, fmt, '--encoding=UTF-8']));
+    mode = `自 ${fromTag} 以来的提交`;
+  }
+  if (!commits.length) {
+    commits = parse(git(root, ['log', '-1', fmt, '--encoding=UTF-8']));
+    mode = fromTag ? '版本未变，本次为最新一次提交' : '最新一次提交';
+  }
+  return { commits, mode };
+}
+
+// ---------- 图片 ----------
+/** 按文件头判断真实格式；认不出返回 null */
+function sniffImage(buf) {
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { mime: 'image/jpeg', ext: 'jpg' };
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e) return { mime: 'image/png', ext: 'png' };
+  if (buf.slice(0, 4).toString('latin1') === 'RIFF' && buf.slice(8, 12).toString('latin1') === 'WEBP')
+    return { mime: 'image/webp', ext: 'webp' };
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46) return { mime: 'image/gif', ext: 'gif' };
+  if (buf[0] === 0x42 && buf[1] === 0x4d) return { mime: 'image/bmp', ext: 'bmp' };
+  return null;
+}
+
+const ATTACH_ROOT = path.join(os.homedir(), '.dsh', 'attachments', 'v1', 'objects');
+
+/** DSH 里最近粘贴的一张图 */
+function findLatestAttachment() {
+  if (!fs.existsSync(ATTACH_ROOT)) return '';
+  let best = { p: '', mtime: 0 };
+  for (const dir of fs.readdirSync(ATTACH_ROOT)) {
+    const sub = path.join(ATTACH_ROOT, dir);
+    let names;
+    try {
+      names = fs.readdirSync(sub);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const p = path.join(sub, name);
+      let st;
+      try {
+        st = fs.statSync(p);
+      } catch {
+        continue;
+      }
+      if (!st.isFile() || st.mtimeMs <= best.mtime) continue;
+      const head = Buffer.alloc(16);
+      const fd = fs.openSync(p, 'r');
+      try {
+        fs.readSync(fd, head, 0, 16, 0);
+      } finally {
+        fs.closeSync(fd);
+      }
+      if (!sniffImage(head)) continue;
+      best = { p, mtime: st.mtimeMs };
+    }
+  }
+  return best.p;
+}
+
+function resolveImage(input) {
+  if (input === true || input === '') {
+    const latest = findLatestAttachment();
+    if (!latest) die('没找到最近粘贴的图片', '把图片贴进对话，或用 --image <图片路径> 指定');
+    return latest;
+  }
+  const raw = String(input).trim().replace(/^"(.*)"$/, '$1');
+  const hash = raw.replace(/^sha256:/i, '');
+  if (/^[a-f0-9]{64}$/i.test(hash)) {
+    const p = path.join(ATTACH_ROOT, hash.slice(0, 2).toLowerCase(), hash.toLowerCase());
+    if (fs.existsSync(p)) return p;
+    die(`按 hash 找不到附件：${hash}`);
+  }
+  const p = path.resolve(raw);
+  if (!fs.existsSync(p)) die(`找不到图片：${raw}`);
+  if (!sniffImage(fs.readFileSync(p).subarray(0, 16))) die(`不是可识别的图片：${p}`);
+  return p;
+}
+
+// ---------- 微信开发者工具 ----------
+const WIN_CLI_CANDIDATES = [
+  'C:\\Program Files (x86)\\Tencent\\微信web开发者工具\\cli.bat',
+  'C:\\Program Files\\Tencent\\微信web开发者工具\\cli.bat',
+  'D:\\Program Files (x86)\\Tencent\\微信web开发者工具\\cli.bat',
+  'E:\\微信web开发者工具\\cli.bat',
+  path.join(os.homedir(), 'AppData', 'Local', 'Programs', '微信web开发者工具', 'cli.bat'),
+];
+
+function findDevtoolsCli(cfg) {
+  if (cfg.project.devtoolsCli) {
+    const p = path.resolve(cfg._dir, cfg.project.devtoolsCli);
+    if (fs.existsSync(p)) return p;
+    die(`配置里的 devtoolsCli 不存在：${p}`, '检查路径，或在配置里留空自动探测');
+  }
+  for (const p of WIN_CLI_CANDIDATES) if (fs.existsSync(p)) return p;
+  return '';
+}
+
+function runDevtools(cliPath, args, cwd, timeoutMs = 300000) {
+  const opts = { cwd, encoding: 'buffer', timeout: timeoutMs, windowsHide: true, maxBuffer: 32 * 1024 * 1024 };
+  // .bat 必须经 cmd.exe；显式调用可避开 shell:true 的参数拼接隐患
+  const r =
+    process.platform === 'win32'
+      ? spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/c', cliPath, ...args], opts)
+      : spawnSync(cliPath, args, opts);
+  return {
+    status: r.status,
+    stdout: r.stdout ? r.stdout.toString('utf8') : '',
+    stderr: r.stderr ? r.stderr.toString('utf8') : '',
+  };
+}
+
+function assertDevtoolsLogin(cliPath, cwd) {
+  log.step('检查开发者工具登录态…');
+  const r = runDevtools(cliPath, ['islogin'], cwd, 90000);
+  const m = /"login"\s*:\s*(true|false)/.exec(r.stdout + r.stderr);
+  if (!m) {
+    log.warn('无法解析登录状态，继续尝试（失败请看开发者工具是否已登录）');
+    return;
+  }
+  if (m[1] !== 'true') {
+    die('微信开发者工具未登录', '打开开发者工具扫码登录后重试；登录态失效时命令会一直卡住。');
+  }
+  log.ok('开发者工具已登录');
+}
+
+function readMiniSize(infoPath) {
+  if (!fs.existsSync(infoPath)) return { text: '', bytes: 0 };
+  try {
+    const info = JSON.parse(fs.readFileSync(infoPath, 'utf8'));
+    const bytes = info?.size?.total || 0;
+    return { text: bytes ? `${(bytes / 1024 / 1024).toFixed(2)} MB` : '', bytes };
+  } catch {
+    return { text: '', bytes: 0 };
+  }
+}
+
+function miniPreview(cfg, cliPath) {
+  fs.mkdirSync(cfg.project.buildDir, { recursive: true });
+  const qr = path.join(cfg.project.buildDir, 'preview-qr.jpg');
+  const info = path.join(cfg.project.buildDir, 'preview-info.json');
+  for (const p of [qr, info]) if (fs.existsSync(p)) fs.unlinkSync(p);
+
+  log.step('打预览包并生成二维码…');
+  const t0 = Date.now();
+  const r = runDevtools(
+    cliPath,
+    ['preview', '--project', cfg.project.root, '--qr-format', 'image', '--qr-output', qr, '--info-output', info],
+    cfg.project.root,
+  );
+  const tail = (r.stdout + r.stderr).trim().split('\n').slice(-5).join('\n  ');
+  if (tail) log.dim(tail);
+  if (!fs.existsSync(qr)) {
+    die(
+      `预览失败，未生成二维码（${((Date.now() - t0) / 1000).toFixed(1)}s）`,
+      '常见原因：开发者工具未运行/未登录、项目路径不对、代码有编译错误。',
+    );
+  }
+  const size = readMiniSize(info);
+  log.ok(`二维码已生成（${((Date.now() - t0) / 1000).toFixed(1)}s）`);
+  return { qrPath: qr, sizeText: size.text };
+}
+
+function miniUpload(cfg, cliPath, version, desc) {
+  fs.mkdirSync(cfg.project.buildDir, { recursive: true });
+  const info = path.join(cfg.project.buildDir, 'upload-info.json');
+  if (fs.existsSync(info)) fs.unlinkSync(info);
+  log.step(`上传代码到微信公众平台（版本 ${version}）…`);
+  log.dim(`版本描述：${desc}`);
+  const r = runDevtools(
+    cliPath,
+    ['upload', '--project', cfg.project.root, '--version', version, '--desc', desc, '--info-output', info],
+    cfg.project.root,
+  );
+  const tail = (r.stdout + r.stderr).trim().split('\n').slice(-6).join('\n  ');
+  if (tail) log.dim(tail);
+  if (r.status !== 0) {
+    log.warn('上传未成功，继续后续流程');
+    return { ok: false, sizeText: '' };
+  }
+  log.ok('已上传到公众平台（开发版本）');
+  return { ok: true, sizeText: readMiniSize(info).text };
+}
+
+// ---------- 飞书 ----------
+async function feishuToken(feishu) {
+  const res = await fetch(`${FEISHU}/auth/v3/tenant_access_token/internal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ app_id: feishu.appId, app_secret: feishu.appSecret }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    throw new Error(`获取 tenant_access_token 失败（code=${data.code}）：${data.msg}\n检查 app_id/app_secret 是否正确、应用是否已启用。`);
+  }
+  return data.tenant_access_token;
+}
+
+async function feishuUploadImage(token, imagePath) {
+  const buf = fs.readFileSync(imagePath);
+  const info = sniffImage(buf);
+  if (!info) throw new Error(`不是可识别的图片，飞书传不上去：${imagePath}`);
+  const fd = new FormData();
+  fd.append('image_type', 'message');
+  fd.append('image', new Blob([buf], { type: info.mime }), `qr.${info.ext}`);
+  const res = await fetch(`${FEISHU}/im/v1/images`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: fd,
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    throw new Error(
+      `上传图片失败（code=${data.code}）：${data.msg}\n` +
+        '需要权限 im:resource（或 im:resource:upload），开通后必须重新发布应用版本才生效。',
+    );
+  }
+  return data.data.image_key;
+}
+
+async function feishuSendPost(token, chatId, { title, lines, imageKey }) {
+  const content = {
+    zh_cn: {
+      title,
+      content: [...lines.map((text) => [{ tag: 'text', text }]), ...(imageKey ? [[{ tag: 'img', image_key: imageKey }]] : [])],
+    },
+  };
+  const res = await fetch(`${FEISHU}/im/v1/messages?receive_id_type=chat_id`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ receive_id: chatId, msg_type: 'post', content: JSON.stringify(content) }),
+  });
+  const data = await res.json();
+  if (data.code !== 0) {
+    throw new Error(
+      `发送消息失败（code=${data.code}）：${data.msg}\n` +
+        '常见原因：缺少 im:message / im:message:send_as_bot 权限；机器人未加入该群；chatId 不对。',
+    );
+  }
+  return data.data;
+}
+
+async function feishuSendText(webhook, text) {
+  const res = await fetch(webhook, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json; charset=utf-8' },
+    body: JSON.stringify({ msg_type: 'text', content: { text } }),
+  });
+  const data = await res.json();
+  if (data.code !== 0 && data.StatusCode !== 0) throw new Error(`Webhook 发送失败：${data.msg || JSON.stringify(data)}`);
+  return data;
+}
+
+async function feishuListChats(token) {
+  const res = await fetch(`${FEISHU}/im/v1/chats?page_size=50`, { headers: { Authorization: `Bearer ${token}` } });
+  const data = await res.json();
+  if (data.code !== 0) {
+    throw new Error(
+      `列群失败（code=${data.code}）：${data.msg}\n需要权限 im:chat:readonly（开通后重新发布应用版本）。`,
+    );
+  }
+  return data.data?.items || [];
+}
+
+// ---------- 消息 ----------
+function stamp() {
+  const d = new Date();
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function composeLines({ version, commits, mode, sizeText, qrKind, items, desc, projectRoot }) {
+  const headSha = isGitRepo(projectRoot) ? git(projectRoot, ['rev-parse', '--short', 'HEAD']) : '';
+  const branch = isGitRepo(projectRoot) ? git(projectRoot, ['rev-parse', '--abbrev-ref', 'HEAD']) : '';
+
+  const lines = [`版本：${version}`, `时间：${stamp()}`];
+  if (branch) lines.push(`分支：${branch}　提交：${headSha}`);
+  if (sizeText) lines.push(`包体积：${sizeText}`);
+  lines.push(
+    qrKind === 'experience'
+      ? '二维码：体验版（扫码进最新体验版）'
+      : '二维码：临时预览码（约 25 分钟有效，过期需重发）',
+  );
+  lines.push('');
+
+  if (items && items.length) {
+    // 提炼过的人话清单：一行一条，原样使用
+    lines.push('本次改动：');
+    items.forEach((t, i) => lines.push(`${i + 1}. ${t}`));
+  } else if (commits.length) {
+    // 兜底：展开 commit 原文，带长度预算
+    lines.push(`本次改动（${mode}）：`);
+    const BUDGET = 2400;
+    let used = lines.join('\n').length;
+    let truncated = false;
+    const shown = commits.slice(0, 8);
+    for (let i = 0; i < shown.length; i++) {
+      const block = [`${i + 1}. ${shown[i].subject}`, ...shown[i].details.map((d) => `   - ${d}`)];
+      const size = block.join('\n').length;
+      if (used + size > BUDGET) {
+        truncated = true;
+        break;
+      }
+      lines.push(...block);
+      used += size;
+    }
+    if (truncated || commits.length > shown.length) lines.push('… 改动较多，完整记录见提交历史');
+  }
+
+  if (desc) {
+    lines.push('');
+    lines.push(`补充说明：${desc}`);
+  }
+  return lines;
+}
+
+// ---------- 子命令 ----------
+async function cmdCheck(cfg) {
+  console.log(`${C.bold}配置检查${C.reset}`);
+  const cli = findDevtoolsCli(cfg);
+  console.log(`  配置文件    : ${cfg._path}`);
+  console.log(`  项目目录    : ${cfg.project.root}`);
+  console.log(`  开发者工具  : ${cli ? `${C.green}${cli}${C.reset}` : `${C.yellow}未找到（仅支持 --image 发群）${C.reset}`}`);
+  console.log(`  体验版二维码: ${cfg.project.experienceQr || '未配置'}`);
+
+  const f = cfg.feishu;
+  if (!f.appId || !f.appSecret) {
+    if (f.webhook) log.warn('只配了 webhook：能发文字，发不了图片。要发图请配 appId/appSecret。');
+    else log.err('既没有 appId/appSecret，也没有 webhook');
+    return;
+  }
+  log.step('校验飞书应用凭证…');
+  const token = await feishuToken(f);
+  log.ok('app_id / app_secret 有效');
+
+  if (f.chatId) log.ok(`目标群 chatId：${f.chatId}`);
+  else log.warn('未配置 chatId，用 --list-chats 查询');
+
+  log.step('校验上传图片权限…');
+  try {
+    // 用 1x1 透明 PNG 试探权限，不产生可见消息
+    const probe = path.join(os.tmpdir(), `feishu-probe-${process.pid}.png`);
+    const px = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+      'base64',
+    );
+    fs.writeFileSync(probe, px);
+    await feishuUploadImage(token, probe);
+    fs.unlinkSync(probe);
+    log.ok('图片上传权限正常（im:resource）');
+  } catch (e) {
+    log.err(e.message);
+  }
+}
+
+async function cmdListChats(cfg) {
+  const f = cfg.feishu;
+  if (!f.appId || !f.appSecret) die('需要先配置 feishu.appId / appSecret');
+  const token = await feishuToken(f);
+  const chats = await feishuListChats(token);
+  if (!chats.length) {
+    console.log('机器人还没加入任何群。到目标群「设置 → 群机器人 → 添加机器人」把它拉进去，再试。');
+    return;
+  }
+  console.log(`\n机器人所在的群（${chats.length} 个）：\n`);
+  for (const c of chats) {
+    console.log(`  chat_id: ${C.bold}${c.chat_id}${C.reset}`);
+    console.log(`  群名称 : ${c.name || '(未命名)'}`);
+    console.log('');
+  }
+  console.log('把目标群的 chat_id 填入 release.config.json 的 feishu.chatId');
+}
+
+// ---------- 主流程 ----------
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  const cfg = loadConfig(args);
+
+  if (args.check) return cmdCheck(cfg);
+  if (args['list-chats']) return cmdListChats(cfg);
+
+  const dryRun = Boolean(args['dry-run']);
+  const feishu = cfg.feishu;
+  const hasApp = Boolean(feishu.appId && feishu.appSecret);
+  const hasWebhook = Boolean(feishu.webhook);
+
+  // 1. 版本号
+  const ver = resolveVersion(cfg, args.version);
+  log.step(`版本号：${C.bold}${ver.version}${C.reset}（来源：${ver.source}）`);
+  const consistency = checkVersionConsistency(cfg, ver);
+  if (!consistency.ok) log.warn(consistency.note);
+
+  // 2. 只上传模式
+  const cli = findDevtoolsCli(cfg);
+  if (args['upload-only']) {
+    if (!cli) die('未找到微信开发者工具 CLI，无法上传');
+    assertDevtoolsLogin(cli, cfg.project.root);
+    const commits = collectCommits(cfg.project.root, ver.tag);
+    const desc = (args.desc || commits.commits.slice(0, 3).map((c) => c.subject).join('；') || '自动上传').slice(0, 120);
+    const up = miniUpload(cfg, cli, ver.version, desc);
+    if (!up.ok) die('上传失败，见上方输出');
+    console.log(`\n${C.green}上传完成${C.reset}  公众平台版本号：${ver.version}`);
+    log.warn('去公众平台「版本管理 → 开发版本」点一次「选为体验版」，体验版码才会指向该版本');
+    return;
+  }
+
+  // 3. 来源：用户给的图 / 自动生成
+  let qrPath;
+  let sizeText = '';
+  let qrKind = args.kind === 'preview' ? 'preview' : 'experience';
+  const customImage = args.image !== undefined;
+
+  if (customImage) {
+    qrPath = resolveImage(args.image);
+    log.ok(`使用指定图片：${qrPath}`);
+  } else {
+    const expQr = cfg.project.experienceQr;
+    const useExp = expQr && fs.existsSync(expQr) && !args['preview-qr'];
+    if (useExp) {
+      qrPath = expQr;
+      qrKind = 'experience';
+      const ageDays = (Date.now() - fs.statSync(expQr).mtimeMs) / 86400000;
+      log.ok(`使用固定体验版码：${expQr}`);
+      if (ageDays > 6) log.warn(`这张体验版码已保存 ${ageDays.toFixed(1)} 天，微信体验版码通常 7 天过期，建议重新获取`);
+      if (!args.upload && !dryRun) log.warn('没有 --upload：体验版指向的可能仍是旧版本');
+    } else {
+      if (!cli) die('未找到微信开发者工具 CLI，且没有配置体验版码', '用 --image 指定图片，或配置 project.devtoolsCli');
+      assertDevtoolsLogin(cli, cfg.project.root);
+      const pv = miniPreview(cfg, cli);
+      qrPath = pv.qrPath;
+      sizeText = pv.sizeText;
+      qrKind = 'preview';
+    }
+    if (args.upload && cli) {
+      assertDevtoolsLogin(cli, cfg.project.root);
+      const up = miniUpload(cfg, cli, ver.version, args.desc || ver.tag);
+      if (up.ok && up.sizeText) sizeText = up.sizeText;
+    }
+  }
+
+  if (!hasApp && !hasWebhook) {
+    if (dryRun) log.warn('未配置飞书发送方式，本次只生成不发送');
+    else die('未配置飞书发送方式', '在 release.config.json 填 feishu.appId/appSecret（推荐）或 feishu.webhook');
+  }
+
+  // 4. 改动清单
+  const changes = collectCommits(cfg.project.root, args.from || ver.tag);
+  let items = null;
+  if (args['changes-file']) {
+    const p = path.resolve(args['changes-file']);
+    if (!fs.existsSync(p)) die(`找不到改动清单：${p}`, '一行一条，例如：\n  1. 修改了我的界面胶囊没对齐问题\n  2. 修复了端口被占用的问题');
+    items = fs
+      .readFileSync(p, 'utf8')
+      .split('\n')
+      .map((l) => l.trim().replace(/^\d+[.、)]\s*/, ''))
+      .filter(Boolean);
+    if (!items.length) die(`改动清单是空的：${p}`);
+    log.ok(`使用人话改动清单：${items.length} 条`);
+  } else if (changes.commits.length) {
+    log.ok(`改动：${changes.commits.length} 条提交（将展开提交原文；建议用 --changes-file 传入提炼后的清单）`);
+  }
+
+  // 5. 组装消息
+  const lines = composeLines({
+    version: ver.version,
+    commits: changes.commits,
+    mode: changes.mode,
+    sizeText,
+    qrKind,
+    items,
+    desc: args.desc,
+    projectRoot: cfg.project.root,
+  });
+  const title = `${cfg.message.title || '版本发布'} · ${ver.version}${qrKind === 'experience' ? ' 体验版' : ' 预览版'}`;
+  const tips = cfg.message.tips || (qrKind === 'experience' ? '扫码进入体验版，需已添加为体验成员。' : '扫码进入该版本，需是项目成员或体验成员。');
+
+  console.log(`\n${C.bold}将要发送的群消息${C.reset}`);
+  console.log(`${C.dim}────────────${C.reset}`);
+  console.log(`${C.bold}${title}${C.reset}`);
+  lines.forEach((l) => log.plain(l));
+  console.log(`${C.dim}[二维码图片]${C.reset}`);
+  console.log(`${C.dim}────────────${C.reset}`);
+
+  if (dryRun) {
+    log.warn('--dry-run：只生成预览，不发送');
+    console.log(`\n二维码：${qrPath}`);
+    return;
+  }
+
+  // 6. 发送
+  if (hasApp) {
+    log.step('上传二维码到飞书…');
+    const token = await feishuToken(feishu);
+    const imageKey = await feishuUploadImage(token, qrPath);
+    log.ok(`图片已上传：${imageKey}`);
+    if (!feishu.chatId) die('缺少 feishu.chatId', '运行 --list-chats 查询后填入配置');
+    log.step(`发送到群 ${feishu.chatId}…`);
+    const sent = await feishuSendPost(token, feishu.chatId, { title, lines: [...lines, '', tips], imageKey });
+    log.ok(`已发送，message_id=${sent.message_id}`);
+  } else {
+    log.step('用 webhook 发送纯文字（不含图片）…');
+    await feishuSendText(feishu.webhook, `${title}\n\n${lines.join('\n')}\n\n${tips}\n\n二维码：${qrPath}`);
+    log.ok('已发送');
+  }
+  console.log(`\n${C.green}完成${C.reset}  二维码：${qrPath}`);
+}
+
+main().catch((e) => {
+  console.error(`\n${C.red}失败${C.reset}：${e.message}`);
+  process.exit(1);
+});
