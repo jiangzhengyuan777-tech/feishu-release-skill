@@ -93,7 +93,7 @@ function loadConfig(args) {
   if (!cfgPath) {
     die(
       '找不到 release.config.json（从当前目录向上也没找到）',
-      '复制模板后填写：\n  copy templates\\release.config.example.json release.config.json\n或用 --config <路径> 指定',
+      '先跑首次使用检查，它会告诉你缺什么：\n  node scripts/release.mjs --onboard\n\n或复制模板手工填：\n  copy templates\\release.config.example.json release.config.json',
     );
   }
   let cfg;
@@ -553,6 +553,139 @@ function composeLines({ version, commits, mode, sizeText, qrKind, items, desc, p
 }
 
 // ---------- 子命令 ----------
+/**
+ * 首次使用诊断：配置缺失时也能跑。
+ * 输出「已经有什么 / 还缺什么 / 缺的东西去哪拿」，供 AI 在对话里逐项向用户索要。
+ */
+async function cmdOnboard(args) {
+  console.log(`${C.bold}=== 首次使用检查 ===${C.reset}\n`);
+
+  const cfgPath = findConfigFile(args.config);
+  let cfg = { feishu: {}, project: {}, message: {}, version: {} };
+  if (cfgPath) {
+    try {
+      cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+      console.log(`  配置文件：${cfgPath}`);
+    } catch (e) {
+      console.log(`  ${C.red}配置文件解析失败${C.reset}：${e.message}`);
+      return;
+    }
+  } else {
+    console.log(`  配置文件：${C.yellow}不存在${C.reset}`);
+    console.log(`  ${C.dim}下一步：copy templates\\release.config.example.json release.config.json${C.reset}`);
+  }
+  cfg.feishu = cfg.feishu || {};
+  cfg.project = cfg.project || {};
+  cfg.version = cfg.version || {};
+  const cfgDir = cfgPath ? path.dirname(cfgPath) : process.cwd();
+  console.log('');
+
+  const todo = [];
+  const ok = (label, detail) => console.log(`  ${C.green}✓${C.reset} ${label}${detail ? '：' + detail : ''}`);
+  const miss = (label, lines) => {
+    console.log(`  ${C.red}✗${C.reset} ${label}：${C.yellow}缺失${C.reset}`);
+    todo.push(lines);
+  };
+
+  // 1. 飞书凭证
+  let token = '';
+  if (cfg.feishu.appId && cfg.feishu.appSecret) {
+    ok('飞书 App ID', cfg.feishu.appId);
+    try {
+      token = await feishuToken(cfg.feishu);
+      ok('飞书凭证', 'tenant_access_token 获取成功');
+    } catch (e) {
+      console.log(`  ${C.red}✗${C.reset} 飞书凭证校验失败：${String(e.message).split('\n')[0]}`);
+      todo.push([
+        '核对 App ID / App Secret 是否复制正确，应用是否已启用',
+        '在哪拿：https://open.feishu.cn/app → 你的应用 → 凭证与基础信息',
+      ]);
+    }
+  } else {
+    miss('飞书应用凭证', [
+      '需要你提供：App ID（cli_ 开头）+ App Secret',
+      '在哪拿：https://open.feishu.cn/app → 你的应用 → 凭证与基础信息',
+      '还没有应用：先去建一个企业自建应用并加「机器人」能力，步骤见 docs/SETUP-FEISHU.md',
+    ]);
+  }
+
+  // 2. 发图权限
+  if (token) {
+    try {
+      const probe = path.join(os.tmpdir(), `feishu-onboard-${process.pid}.png`);
+      fs.writeFileSync(
+        probe,
+        Buffer.from(
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+          'base64',
+        ),
+      );
+      await feishuUploadImage(token, probe);
+      fs.unlinkSync(probe);
+      ok('上传图片权限', 'im:resource 可用');
+    } catch (e) {
+      console.log(`  ${C.red}✗${C.reset} 上传图片权限不可用`);
+      todo.push([String(e.message).split('\n')[0], '开通权限后必须重新发布应用版本才生效']);
+    }
+  }
+
+  // 3. 群
+  if (cfg.feishu.chatId) {
+    ok('目标群 chatId', cfg.feishu.chatId);
+  } else if (token) {
+    try {
+      const chats = await feishuListChats(token);
+      if (chats.length) {
+        console.log(`  ${C.yellow}!${C.reset} 目标群 chatId：未配置（机器人已在 ${chats.length} 个群里）`);
+        chats.slice(0, 5).forEach((c) => console.log(`      ${c.chat_id}  ${c.name || '(未命名)'}`));
+        todo.push(['选定上面哪个群作为发版群（把 chat_id 写进 feishu.chatId）']);
+      } else {
+        console.log(`  ${C.red}✗${C.reset} 目标群：机器人还没进任何群`);
+        todo.push(['把机器人拉进目标群：群设置 → 群机器人 → 添加机器人']);
+      }
+    } catch {
+      console.log(`  ${C.yellow}!${C.reset} 目标群 chatId：未配置`);
+      todo.push(['把机器人拉进群后运行 --list-chats 取 chat_id']);
+    }
+  } else {
+    miss('目标群 chatId', ['把机器人拉进群后运行 --list-chats 取 chat_id']);
+  }
+
+  // 4. 项目
+  const rootRaw = args.project || cfg.project.root || '.';
+  const root = path.resolve(cfgDir, rootRaw);
+  if (fs.existsSync(root)) ok('项目目录', root);
+  else miss('项目目录', [`配置里的 project.root 指向不存在：${root}`]);
+
+  // 5. 开发者工具（只发群可以没有）
+  const cli = findDevtoolsCli({ project: cfg.project, _dir: cfgDir });
+  if (typeof cli === 'string' && cli) ok('微信开发者工具', cli);
+  else console.log(`  ${C.yellow}!${C.reset} 微信开发者工具：未找到（只发群可忽略，用 --image 传图）`);
+
+  // 6. 体验版码
+  if (cfg.project.experienceQr) {
+    const p = path.resolve(root, cfg.project.experienceQr);
+    if (fs.existsSync(p)) ok('体验版二维码', p);
+    else console.log(`  ${C.yellow}!${C.reset} 体验版二维码：还没有图（${p}），发版时让用户提供`);
+  } else {
+    console.log(`  ${C.yellow}!${C.reset} 体验版二维码：未配置路径`);
+  }
+
+  // 7. 汇总
+  console.log('');
+  if (!todo.length) {
+    console.log(`${C.green}${C.bold}全部就绪${C.reset}，可以开始发版：`);
+    console.log(`  ${C.dim}node scripts/release.mjs --check${C.reset}`);
+    return;
+  }
+  console.log(`${C.bold}需要用户提供或确认以下事项${C.reset}（在对话里逐项询问，不要一次抛全部）：`);
+  todo.forEach((lines, i) => {
+    console.log(`\n  ${i + 1}. ${lines[0]}`);
+    lines.slice(1).forEach((line) => console.log(`     ${C.dim}${line}${C.reset}`));
+  });
+  console.log(`\n${C.dim}拿到信息后写入 release.config.json，再运行 --check 验证。${C.reset}`);
+}
+
 async function cmdCheck(cfg) {
   console.log(`${C.bold}配置检查${C.reset}`);
   const cli = findDevtoolsCli(cfg);
@@ -612,8 +745,11 @@ async function cmdListChats(cfg) {
 // ---------- 主流程 ----------
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  const cfg = loadConfig(args);
 
+  // 配置可能还不存在：首次使用诊断必须能独立跑
+  if (args.onboard) return cmdOnboard(args);
+
+  const cfg = loadConfig(args);
   if (args.check) return cmdCheck(cfg);
   if (args['list-chats']) return cmdListChats(cfg);
 
@@ -758,5 +894,6 @@ async function main() {
 
 main().catch((e) => {
   console.error(`\n${C.red}失败${C.reset}：${e.message}`);
-  process.exit(1);
+  // 用 exitCode 让 Node 自然退出：Windows 上 process.exit 可能触发 libuv 断言噪音
+  process.exitCode = 1;
 });

@@ -26,56 +26,61 @@ description: 把项目版本发布到飞书群：上传/预览微信小程序、
 
 ---
 
-## 1. 首次安装
+## 1. 首次使用：在对话里把信息要齐（不要甩文档让用户自己看）
 
-### 1.1 飞书自建应用
+用户第一次发版、或配置不全时，**不要**只发个链接。按下面在对话里逐项引导，**一次只问一件事**。
 
-> 免费。需要该企业/团队的管理员或开发者权限。
-
-1. 打开 <https://open.feishu.cn/app> → **创建企业自建应用**（名字随意，如「发版机器人」）
-2. 左侧 **应用功能 → 添加应用能力** → 勾选 **机器人**（只加这一个）
-3. 左侧 **开发配置 → 权限管理** → 搜索并开通：
-
-   | 权限 | 用途 | 必需 |
-   |---|---|---|
-   | `im:message` | 收发消息 | ✅ |
-   | `im:message:send_as_bot` | 以机器人身份发群消息 | ✅ |
-   | `im:resource` | 上传图片（**发二维码必须**） | ✅ |
-   | `im:chat:readonly` | 读取群列表，便于自动找 chatId | 建议 |
-
-4. 左侧 **版本管理与发布 → 创建版本** → 填 `1.0.0` → **申请发布**（管理员身份直接通过）
-
-   > ⚠️ **权限必须发版后才生效**。后台显示「已开通」但接口仍报权限错误，九成是没发新版本。
-
-5. 目标飞书群 → 右上角 **··· → 设置 → 群机器人 → 添加机器人** → 搜应用名 → 添加
-
-6. **凭证与基础信息**页复制 `App ID`（`cli_` 开头）与 `App Secret`
-
-7. 跑 `node scripts/release.mjs --list-chats` 找到目标群的 `chat_id`（`oc_` 开头）
-
-### 1.2 微信开发者工具（仅小程序项目需要）
-
-1. 装好微信开发者工具并**扫码登录**（登录态失效时命令会一直卡住，不是报错）
-2. 设置 → 安全设置 → 打开**服务端口**（CLI 调用依赖它）
-3. 项目根要有 `project.config.json`，`miniprogramRoot` 指向真实小程序目录
-
-### 1.3 配置
+### 1.1 先诊断
 
 ```bash
-cp templates/release.config.example.json release.config.json
+node scripts/release.mjs --onboard
 ```
 
-填 `feishu.appId` / `appSecret` / `chatId`；`project.root` 指向项目根；`version.source` 选版本来源。
+输出会列出：已有什么 ✓、还缺什么 ✗、缺失项去哪拿。按它的 `todo` 顺序问。
 
-`release.config.json` 含密钥，**已在 .gitignore，勿提交**。
+### 1.2 按缺失项逐个要（一次一个）
 
-### 1.4 自检
+**① 要 App ID / App Secret**
+
+> 发版到飞书群需要一个机器人应用。先确认第一步：你在飞书开放平台建过「企业自建应用」吗？
+> - **建过**：打开 <https://open.feishu.cn/app> → 点进应用 → 「凭证与基础信息」→ 把 **App ID**（`cli_` 开头）和 **App Secret** 发我
+> - **没建过**：我给你 5 分钟步骤，全程免费
+
+拿到后写进 `release.config.json` 的 `feishu.appId` / `feishu.appSecret`，再跑一次 `--onboard` 看下一项。
+
+若用户嫌麻烦不想建应用，说明取舍后降到 webhook 模式：能发文字、**发不了二维码图片**，然后继续。
+
+**② 要群**
+
+> 机器人建好了，现在把它拉进群：
+> 群右上角 **··· → 设置 → 群机器人 → 添加机器人** → 搜应用名 → 添加
+> 拉好后告诉我，我帮你查群 ID
+
+然后跑 `--list-chats`，把拿到的 `chat_id` 写进 `feishu.chatId`。
+
+**③ 要二维码图片（每次发版都要，铁律 2）**
+
+> 还需要一张体验版二维码：
+> 公众平台 → 管理 → 版本管理 → 页面**上方**「体验版」区域 → 二维码图片右键另存
+> 存好后把路径发我，或者直接把图片贴进对话
+
+用户贴图后，用 `--image`（不传值会自动取最近粘贴的图）。
+
+### 1.3 最后验证
 
 ```bash
 node scripts/release.mjs --check
 ```
 
-应逐项通过：配置文件、项目目录、开发者工具、凭证换 token、图片上传权限、chatId。
+全部 ✓ 之后才进入发版流程。
+
+### 1.4 引导原则
+
+- **一次只问一件事**，别一口气抛出五条，用户会漏答
+- 每一项都说明「去哪拿 / 怎么做」，不要只说「缺」
+- 用户不知道后台在哪时，直接给完整路径和链接
+- 用户卡在某一步时，问清楚卡在哪一环，针对性解释，不要重复整段流程
+- 用户中途说「先这样吧」，记下进度，下次接着来
 
 ---
 
@@ -132,14 +137,17 @@ node scripts/release.mjs --image <图片路径> --kind experience \
 ## 3. 命令参考
 
 ```bash
+# 首次使用：诊断缺什么（配置不存在也能跑）
+node scripts/release.mjs --onboard
+
+# 配置自检
+node scripts/release.mjs --check
+
 # 完整发版（默认只展示，不发送）
 node scripts/release.mjs --image <图> --changes-file <清单> --kind experience --dry-run
 
 # 真正发送
 node scripts/release.mjs --image <图> --changes-file <清单> --kind experience
-
-# 配置自检
-node scripts/release.mjs --check
 
 # 列出机器人所在的群（找 chatId）
 node scripts/release.mjs --list-chats
@@ -159,6 +167,8 @@ node scripts/release.mjs --image --kind experience
 
 | 参数 | 说明 |
 |---|---|
+| `--onboard` | **首次使用诊断**：列出现有配置、缺失项、去哪拿（配置不存在也能跑） |
+| `--check` | 配置自检：凭证、图片上传权限、群、项目 |
 | `--image <路径\|sha256:xxx>` | 指定二维码图片；不传值则取 DSH 最近粘贴的附件 |
 | `--changes-file <路径>` | 人话改动清单，一行一条（去掉行首编号） |
 | `--kind experience\|preview` | 标记二维码类型，影响消息文案。**默认 preview，发体验版必须显式写 experience** |
