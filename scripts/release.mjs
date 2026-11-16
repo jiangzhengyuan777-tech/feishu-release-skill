@@ -21,6 +21,13 @@ const SELF_DIR = path.dirname(fileURLToPath(import.meta.url));
 const SKILL_ROOT = path.resolve(SELF_DIR, '..');
 const FEISHU = 'https://open.feishu.cn/open-apis';
 
+// 飞书接口用的是内置 fetch / FormData，Node 18 以下没有
+const nodeMajor = Number(process.versions.node.split('.')[0]);
+if (nodeMajor < 18) {
+  console.error(`✗ 需要 Node.js >= 18（当前 ${process.versions.node}），脚本使用内置 fetch / FormData 调用飞书接口。`);
+  process.exit(1);
+}
+
 // ---------- 输出 ----------
 const C = {
   reset: '\x1b[0m', dim: '\x1b[2m', green: '\x1b[32m', yellow: '\x1b[33m',
@@ -59,12 +66,34 @@ function parseArgs(argv) {
 }
 
 // ---------- 配置 ----------
+/** 找配置文件：--config > 环境变量 > 从当前目录逐级向上 */
+function findConfigFile(explicit) {
+  if (explicit) {
+    const p = path.resolve(explicit);
+    if (!fs.existsSync(p)) die(`找不到配置文件：${p}`);
+    return p;
+  }
+  if (process.env.FEISHU_RELEASE_CONFIG) {
+    const p = path.resolve(process.env.FEISHU_RELEASE_CONFIG);
+    if (fs.existsSync(p)) return p;
+  }
+  let dir = process.cwd();
+  for (let i = 0; i < 8; i++) {
+    const p = path.join(dir, 'release.config.json');
+    if (fs.existsSync(p)) return p;
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return '';
+}
+
 function loadConfig(args) {
-  const cfgPath = path.resolve(args.config || process.env.FEISHU_RELEASE_CONFIG || 'release.config.json');
-  if (!fs.existsSync(cfgPath)) {
+  const cfgPath = findConfigFile(args.config);
+  if (!cfgPath) {
     die(
-      `找不到配置文件：${cfgPath}`,
-      '复制模板后填写：\n  copy templates\\release.config.example.json release.config.json',
+      '找不到 release.config.json（从当前目录向上也没找到）',
+      '复制模板后填写：\n  copy templates\\release.config.example.json release.config.json\n或用 --config <路径> 指定',
     );
   }
   let cfg;
@@ -481,9 +510,21 @@ function composeLines({ version, commits, mode, sizeText, qrKind, items, desc, p
   lines.push('');
 
   if (items && items.length) {
-    // 提炼过的人话清单：一行一条，原样使用
+    // 提炼过的人话清单：一行一条；同样受消息长度预算约束
     lines.push('本次改动：');
-    items.forEach((t, i) => lines.push(`${i + 1}. ${t}`));
+    const BUDGET = 2400;
+    let used = lines.join('\n').length;
+    let cutAt = -1;
+    for (let i = 0; i < items.length; i++) {
+      const row = `${i + 1}. ${items[i]}`;
+      if (used + row.length > BUDGET) {
+        cutAt = i;
+        break;
+      }
+      lines.push(row);
+      used += row.length;
+    }
+    if (cutAt >= 0) lines.push(`… 另有 ${items.length - cutAt} 条未展示（受消息长度限制）`);
   } else if (commits.length) {
     // 兜底：展开 commit 原文，带长度预算
     lines.push(`本次改动（${mode}）：`);
@@ -601,12 +642,31 @@ async function main() {
     return;
   }
 
-  // 3. 来源：用户给的图 / 自动生成
   let qrPath;
   let sizeText = '';
   let qrKind = args.kind === 'preview' ? 'preview' : 'experience';
   const customImage = args.image !== undefined;
 
+  // 改动清单：先收集，上传时可用作版本描述
+  const changes = collectCommits(cfg.project.root, args.from || ver.tag);
+
+  // 3. 上传（可选）：与图片来源无关，--image 时也必须生效
+  let loginChecked = false;
+  const ensureLogin = () => {
+    if (loginChecked) return;
+    assertDevtoolsLogin(cli, cfg.project.root);
+    loginChecked = true;
+  };
+  if (args.upload && cli) {
+    if (dryRun) log.warn('--dry-run 只跳过发送；--upload 会真实上传一个新开发版本');
+    ensureLogin();
+    const desc =
+      args.desc || changes.commits.slice(0, 3).map((c) => c.subject).join('；') || ver.tag;
+    const up = miniUpload(cfg, cli, ver.version, desc.slice(0, 120));
+    if (up.ok && up.sizeText) sizeText = up.sizeText;
+  }
+
+  // 4. 图片来源：用户给的图优先，其次复用体验版码，最后才现场打预览码
   if (customImage) {
     qrPath = resolveImage(args.image);
     log.ok(`使用指定图片：${qrPath}`);
@@ -622,16 +682,11 @@ async function main() {
       if (!args.upload && !dryRun) log.warn('没有 --upload：体验版指向的可能仍是旧版本');
     } else {
       if (!cli) die('未找到微信开发者工具 CLI，且没有配置体验版码', '用 --image 指定图片，或配置 project.devtoolsCli');
-      assertDevtoolsLogin(cli, cfg.project.root);
+      ensureLogin();
       const pv = miniPreview(cfg, cli);
       qrPath = pv.qrPath;
       sizeText = pv.sizeText;
       qrKind = 'preview';
-    }
-    if (args.upload && cli) {
-      assertDevtoolsLogin(cli, cfg.project.root);
-      const up = miniUpload(cfg, cli, ver.version, args.desc || ver.tag);
-      if (up.ok && up.sizeText) sizeText = up.sizeText;
     }
   }
 
@@ -640,8 +695,7 @@ async function main() {
     else die('未配置飞书发送方式', '在 release.config.json 填 feishu.appId/appSecret（推荐）或 feishu.webhook');
   }
 
-  // 4. 改动清单
-  const changes = collectCommits(cfg.project.root, args.from || ver.tag);
+  // 4. 改动清单：人话版优先
   let items = null;
   if (args['changes-file']) {
     const p = path.resolve(args['changes-file']);
