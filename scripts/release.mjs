@@ -501,7 +501,7 @@ function composeLines({ version, commits, mode, sizeText, qrKind, items, desc, p
 
   const lines = [`版本：${version}`, `时间：${stamp()}`];
   if (branch) lines.push(`分支：${branch}　提交：${headSha}`);
-  if (sizeText) lines.push(`包体积：${sizeText}`);
+  lines.push(`包体积：${sizeText || '见公众平台'}`);
   lines.push(
     qrKind === 'experience'
       ? '二维码：体验版（扫码进最新体验版）'
@@ -958,9 +958,9 @@ async function main() {
     log.ok(`改动：${changes.commits.length} 条提交（将展开提交原文；建议用 --changes-file 传入提炼后的清单）`);
   }
 
-  // 5. 组装消息
+  // 5. 组装消息（版本号显示带 v 前缀的 tag，与 git 和公众平台口径一致）
   const lines = composeLines({
-    version: ver.version,
+    version: ver.tag,
     commits: changes.commits,
     mode: changes.mode,
     sizeText,
@@ -969,8 +969,12 @@ async function main() {
     desc: args.desc,
     projectRoot: cfg.project.root,
   });
-  const title = `${cfg.message.title || '版本发布'} · ${ver.version}${qrKind === 'experience' ? ' 体验版' : ' 预览版'}`;
-  const tips = cfg.message.tips || (qrKind === 'experience' ? '扫码进入体验版，需已添加为体验成员。' : '扫码进入该版本，需是项目成员或体验成员。');
+  const title = `${cfg.message.title || '版本发布'} · ${ver.tag}${qrKind === 'experience' ? ' 体验版' : ' 预览版'}`;
+  const tips =
+    cfg.message.tips ||
+    (qrKind === 'experience'
+      ? '扫码进入体验版，需你已在小程序「体验成员」名单里。'
+      : '扫码进入该版本，需你是小程序项目成员或体验成员。');
 
   console.log(`\n${C.bold}将要发送的群消息${C.reset}`);
   console.log(`${C.dim}────────────${C.reset}`);
